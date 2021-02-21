@@ -1,0 +1,5 @@
+stylegan2 https://github.com/rosinality/stylegan2-pytorch
+dafan - https://github.com/spacejake/face-alignment
+mofile face net - https://github.com/TreB1eN/InsightFace_Pytorch
+pixel2style2pixel - https://github.com/eladrich/pixel2style2pixel
+ffhq align - 
