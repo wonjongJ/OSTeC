@@ -126,7 +126,7 @@ class Inpainter():
         )
 
         self.perceptual_resize = torch.nn.Upsample(size = (self.perceptual_size, self.perceptual_size), mode='bilinear')
-        self.perceptual_feature_resize = torch.nn.Upsample(size = (self.perceptual_size//8, self.perceptual_size//8), mode='bilinear')
+        self.perceptual_feature_resize = torch.nn.AdaptiveAvgPool2d((self.perceptual_size//8, self.perceptual_size//8))
         self.face_recognition_resize = torch.nn.Upsample(size = (self.face_recognition_size, self.face_recognition_size), mode='bilinear')
         self.landmark_resize = torch.nn.Upsample(size = (self.landmark_size, self.landmark_size), mode='bilinear')
         self.regressor_resize = self.landmark_resize
@@ -201,7 +201,7 @@ class Inpainter():
             pm_loss = self.photometric_loss(image, fake_image, photometric_mask)
             id_loss = self.identity_loss(image, fake_image, photometric_mask)
             lm_loss = self.landmark_loss(landmarks, fake_image)
-            pc_loss = self.perceptual_loss(image, fake_image, photometric_mask)
+            pc_loss = self.perceptual_loss(image, fake_image, perceptual_mask)
 
             loss = pm_loss * self.lambda_photometric +\
                     id_loss * self.lambda_identity +\
@@ -240,9 +240,9 @@ class Inpainter():
 
     
     def perceptual_loss(self, image, fake_image, mask):
-        resized_image = self.perceptual_resize(mask * image)
-        resized_fake_image = self.perceptual_resize(mask * fake_image) 
-        loss = torch.mean(torch.log(torch.cosh((self.perceptual(resized_image) - self.perceptual(resized_fake_image)))))
+        resized_image = self.perceptual_resize(image)
+        resized_fake_image = self.perceptual_resize(fake_image) 
+        loss = torch.mean(torch.log(torch.cosh(mask * (self.perceptual(resized_image) - self.perceptual(resized_fake_image)))))
         # resized_image = self.perceptual_resize(image)
         # resized_fake_image = self.perceptual_resize(fake_image)
         # loss = torch.mean(torch.log(torch.cosh(mask * (self.perceptual(resized_image) - self.perceptual(resized_fake_image)))))
