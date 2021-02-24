@@ -132,14 +132,14 @@ class Inpainter():
         self.regressor_resize = self.landmark_resize
 
 
-    def __call__(self, image, mask, dense_landmarks):
+    def __call__(self, i0, image, mask, dense_landmarks):
         dense_landmarks = (dense_landmarks+1) * self.size/2
         dense_landmarks[:, 1] = self.size-dense_landmarks[:, 1]
         landmarks = dense_landmarks[self.landmark_indices]
 
         image, mask, dense_landmarks = align_image_and_landmarks(image, mask, dense_landmarks, landmarks, self.size)
         landmarks = dense_landmarks[self.landmark_indices]
-        
+        i0 = self.transform(i0).unsqueeze(0).to(self.device)
         image = self.transform(image).unsqueeze(0).to(self.device)
         mask = self.mask_transform(mask).unsqueeze(0).to(self.device)
         landmarks = torch.from_numpy(landmarks).to(self.device)
@@ -177,7 +177,7 @@ class Inpainter():
         return result_image, dense_landmarks
         
 
-    def optimize(self, image, mask, landmarks, wp):
+    def optimize(self, i0, image, mask, landmarks, wp):
         wp_split = [wp[:, :9].clone().detach(), wp[:, 9:self.num_layers-1].clone().detach(), wp[:, self.num_layers-1:].clone().detach()]
 
         wp_split[0].requires_grad=True
@@ -199,7 +199,7 @@ class Inpainter():
         for idx in pbar:
             fake_image, _ = self.g_ema(torch.cat(wp_split, dim=1), input_is_wp=True, randomize_noise=False)
             pm_loss = self.photometric_loss(image, fake_image, photometric_mask)
-            id_loss = self.identity_loss(image, fake_image, photometric_mask)
+            id_loss = self.identity_loss(i0, fake_image)
             lm_loss = self.landmark_loss(landmarks, fake_image)
             pc_loss = self.perceptual_loss(image, fake_image, perceptual_mask)
 
@@ -227,13 +227,13 @@ class Inpainter():
         return loss.squeeze()
 
 
-    def identity_loss(self, image, fake_image, mask):
-        resized_image = self.face_recognition_resize(image * mask)
-        resized_fake_image = self.face_recognition_resize(fake_image * mask)
+    def identity_loss(self, i0, fake_image):
+        resized_i0 = self.face_recognition_resize(i0)
+        resized_fake_image = self.face_recognition_resize(fake_image)
         #NO MASK
         #resized_image = self.face_recognition_resize(image)
         #resized_fake_image = self.face_recognition_resize(fake_image)
-        FI_0 = self.face_recognition(resized_image)
+        FI_0 = self.face_recognition(resized_i0)
         FG_i = self.face_recognition(resized_fake_image)
         loss = 1 - (torch.matmul(FI_0, FG_i.T)) / (torch.norm(FI_0) * torch.norm(FG_i))
         return loss.squeeze()
