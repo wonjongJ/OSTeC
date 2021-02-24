@@ -165,7 +165,7 @@ class Inpainter():
             wp = mean_w.reshape(1, 1, 512).repeat(1, self.num_layers, 1).detach().clone()
 
         print('optimizing wp')
-        wp = self.optimize(image, mask, landmarks, wp)
+        wp = self.optimize(i0, image, mask, landmarks, wp)
 
         result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
         result_image = self.to_pil(result_image.squeeze(0).cpu())
@@ -179,11 +179,12 @@ class Inpainter():
 
     def optimize(self, i0, image, mask, landmarks, wp):
         wp_split = [wp[:, :9].clone().detach(), wp[:, 9:self.num_layers-1].clone().detach(), wp[:, self.num_layers-1:].clone().detach()]
-
+        
         wp_split[0].requires_grad=True
-        wp_split[1].requires_grad=False
+        # wp_split[1] can be excluded when optimizing by setting requires_grad=False and removing from Adam optimizer optimizing parameter lists
+        wp_split[1].requires_grad=True
         wp_split[2].requires_grad=True
-        optimizer = torch.optim.Adam([wp_split[0], wp_split[2]], lr=self.lr)
+        optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]], lr=self.lr)
 
 
         # optimizer = torch.optim.Adam([wp], lr=self.lr)
