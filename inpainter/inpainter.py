@@ -57,11 +57,11 @@ class Inpainter():
         
         #### HYPERPARAMETERS
         ### TRAINING
-        self.lambda_photometric = 1
-        self.lambda_identity = 1
-        self.lambda_landmark = 1e-1
+        self.lambda_photometric = 1e-1
+        self.lambda_identity = 1e-1
+        self.lambda_landmark = 1
         self.lambda_perceptual = 1
-        self.lambda_noise = 1e4
+        self.lambda_noise = 1e1
         self.lr = 2e-2
         self.iterations = 150
 
@@ -153,6 +153,10 @@ class Inpainter():
             wp = self.regressor(self.regressor_resize(image))
             wp = wp.clone().detach()
 
+            result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
+            result_image = self.to_pil(result_image.squeeze(0).cpu())
+            result_image.save('inpainted_initial.png')
+
         #init noise
         
         log_size = int(math.log(1024, 2))
@@ -161,7 +165,7 @@ class Inpainter():
         for layer_idx in range(num_layers):
             res = (layer_idx + 5) // 2
             shape = [1, 1, 2 ** res, 2 ** res]
-            noises.append(torch.randn(*shape, device=device).normal_())
+            noises.append(torch.randn(*shape, device=self.device).normal_())
             noises[layer_idx].requires_grad=True
         # noises=None
 
@@ -181,6 +185,8 @@ class Inpainter():
         print('optimizing wp')
         wp, noises = self.optimize(i0, image, mask, landmarks, wp, noises)
 
+
+        # result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
         result_image, _  = self.g_ema(wp, noise=noises, input_is_wp=True, randomize_noise=False)
         result_image = self.to_pil(result_image.squeeze(0).cpu())
 
@@ -199,6 +205,7 @@ class Inpainter():
         wp_split[1].requires_grad=True
         wp_split[2].requires_grad=True
         # include noise optimizer
+        # optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]], lr=self.lr)
         optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]]+noises, lr=self.lr)
 
 
@@ -215,10 +222,14 @@ class Inpainter():
         for idx in pbar:
             # perturb wp code
             wp_merge = torch.cat(wp_split, dim=1)
-            t = max(0, float(self.iterations - idx * 3)/self.iterations)
+            # perturb until 1/3 of iterations
+            t = max(0, float(self.iterations - idx * 3)/(self.iterations))
             wp_tilde = wp_merge + torch.randn(wp_merge.shape, device=self.device) * t * t
 
-            fake_image, _ = self.g_ema(torch.cat(wp_split, dim=1), noise=noises, input_is_wp=True, randomize_noise=False)
+            # fake_image, _ = self.g_ema(wp_tilde, input_is_wp=True, randomize_noise=False)
+            # fake_image, _ = self.g_ema(wp_merge, input_is_wp=True, randomize_noise=False)
+            fake_image, _ = self.g_ema(wp_tilde, noise=noises, input_is_wp=True, randomize_noise=False)
+            # fake_image, _ = self.g_ema(wp_merge, noise=noises, input_is_wp=True, randomize_noise=False)
             pm_loss = self.photometric_loss(image, fake_image, photometric_mask)
             id_loss = self.identity_loss(i0, fake_image)
             lm_loss = self.landmark_loss(landmarks, fake_image)
@@ -232,6 +243,7 @@ class Inpainter():
                     pc_loss * self.lambda_perceptual +\
                     lm_loss * self.lambda_landmark +\
                     loss_noise * self.lambda_noise
+                    
 
             optimizer.zero_grad()
             loss.backward()
