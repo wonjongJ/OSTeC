@@ -22,7 +22,7 @@ from ffhq_align import *
 from landmark_detector import *
 from mobile_face_net import *
 from psp.psp import pSp
-LANDMARK_INDICES_PATH = os.path.join(os.path.dirname(__file__), 'kpt_ind.npy')
+LANDMARK_INDICES_PATH = os.path.join(os.path.dirname(__file__), 'innerLandmarkIndex.npy')
 
 class UnNormalize(object):
     def __init__(self, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]):
@@ -48,22 +48,27 @@ class FANNormalize(object):
 
 
 class Inpainter():
-    def __init__(self, stylegan2_ckpt=os.path.join(os.path.dirname(__file__), 'checkpoint/stylegan2-ffhq-config-f.pt'), 
-                        face_recognition_ckpt = os.path.join(os.path.dirname(__file__), 'checkpoint/model_mobilefacenet.pth'), 
-                        landmark_detector_ckpt=os.path.join(os.path.dirname(__file__), 'checkpoint/DAFAN-4.pth.tar'),
-                        regressor_ckpt = os.path.join(os.path.dirname(__file__), 'checkpoint/psp_ffhq_encode.pt')):
+    def __init__(self, lambda_photometric = 5, lambda_identity = 1e-1, lambda_landmark = 1, lambda_perceptual = 1, lambda_noise = 1e5,
+                    iterations = 150, lr = 2e-2,
+                    optimize_noise = True, perturb_wp = True,
+                    stylegan2_ckpt=os.path.join(os.path.dirname(__file__), 'checkpoint/stylegan2-ffhq-config-f.pt'), 
+                    face_recognition_ckpt = os.path.join(os.path.dirname(__file__), 'checkpoint/model_mobilefacenet.pth'), 
+                    landmark_detector_ckpt=os.path.join(os.path.dirname(__file__), 'checkpoint/DAFAN-4.pth.tar'),
+                    regressor_ckpt = os.path.join(os.path.dirname(__file__), 'checkpoint/psp_ffhq_encode.pt')):
         super().__init__()
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         #### HYPERPARAMETERS
         ### TRAINING
-        self.lambda_photometric = 1e-1
-        self.lambda_identity = 1e-1
-        self.lambda_landmark = 1
-        self.lambda_perceptual = 1
-        self.lambda_noise = 1e1
-        self.lr = 2e-2
-        self.iterations = 150
+        self.lambda_photometric = lambda_photometric
+        self.lambda_identity = lambda_identity
+        self.lambda_landmark = lambda_landmark
+        self.lambda_perceptual = lambda_perceptual
+        self.lambda_noise = lambda_noise
+        self.lr = lr
+        self.iterations = iterations
+        self.optimize_noise = optimize_noise
+        self.perturb_wp = perturb_wp
 
         ### MODELS
         self.size = 1024 # input image size
@@ -121,7 +126,6 @@ class Inpainter():
         self.to_pil = transforms.Compose(
             [
                 UnNormalize(),## Visualize Extracted Facial Landmarks from dlib
-                #torch.clamp(0.0,1.0),
                 transforms.ToPILImage(),
             ]
         )
@@ -149,44 +153,30 @@ class Inpainter():
 
         print('initializing wp')
         # w_ini is mean latent for face
-        if self.regressor is not None:
-            wp = self.regressor(self.regressor_resize(image))
-            wp = wp.clone().detach()
+        wp = self.regressor(self.regressor_resize(image))
+        wp = wp.clone().detach()
 
-            result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
-            result_image = self.to_pil(result_image.squeeze(0).cpu())
-            result_image.save('inpainted_initial.png')
+        # save initial guess image
+        # result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
+        # result_image = self.to_pil(result_image.squeeze(0).cpu())
+        # result_image.save('inpainted_initial.png')
 
-        #init noise
-        
-        log_size = int(math.log(1024, 2))
-        num_layers = (log_size - 2) * 2 + 1
-        noises = []
-        for layer_idx in range(num_layers):
-            res = (layer_idx + 5) // 2
-            shape = [1, 1, 2 ** res, 2 ** res]
-            noises.append(torch.randn(*shape, device=self.device).normal_())
-            noises[layer_idx].requires_grad=True
-        # noises=None
-
-        # a regressor needs to be trained
+        if self.optimize_noise:
+            #init noise
+            log_size = int(math.log(1024, 2))
+            num_layers = (log_size - 2) * 2 + 1
+            noises = []
+            for layer_idx in range(num_layers):
+                res = (layer_idx + 5) // 2
+                shape = [1, 1, 2 ** res, 2 ** res]
+                noises.append(torch.randn(*shape, device=self.device).normal_())
+                noises[layer_idx].requires_grad=True
         else:
-            print('no regressor - using mean face as initiailzation')
-            n=4096
-            samples = 256
-            w = []
-            for _ in range(n//samples):
-                sample_z = torch.randn(samples, 512, device=self.device)
-                w.append(self.g_ema.style(sample_z))
-            w = torch.cat(w, dim=0)
-            mean_w = w.mean(dim=0)
-            wp = mean_w.reshape(1, 1, 512).repeat(1, self.num_layers, 1).detach().clone()
+            noises=None
 
         print('optimizing wp')
         wp, noises = self.optimize(i0, image, mask, landmarks, wp, noises)
 
-
-        # result_image, _  = self.g_ema(wp, input_is_wp=True, randomize_noise=False)
         result_image, _  = self.g_ema(wp, noise=noises, input_is_wp=True, randomize_noise=False)
         result_image = self.to_pil(result_image.squeeze(0).cpu())
 
@@ -198,64 +188,82 @@ class Inpainter():
         
 
     def optimize(self, i0, image, mask, landmarks, wp, noises):
-        wp_split = [wp[:, :9].clone().detach(), wp[:, 9:self.num_layers-1].clone().detach(), wp[:, self.num_layers-1:].clone().detach()]
-        
-        wp_split[0].requires_grad=True
-        # wp_split[1] can be excluded when optimizing by setting requires_grad=False and removing from Adam optimizer optimizing parameter lists
-        wp_split[1].requires_grad=True
-        wp_split[2].requires_grad=True
-        # include noise optimizer
-        # optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]], lr=self.lr)
-        optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]]+noises, lr=self.lr)
-
-
-        # optimizer = torch.optim.Adam([wp], lr=self.lr)
-        pbar = range(self.iterations)
-        pbar = tqdm(pbar, initial=0, dynamic_ncols=True, smoothing=0.01)
-
         photometric_mask = mask.clone().detach()
         photometric_mask = photometric_mask.repeat(1, 3, 1, 1)
-
         perceptual_mask = self.perceptual_feature_resize(mask.clone().detach())
         perceptual_mask = perceptual_mask.repeat(1, 512, 1, 1)
 
-        for idx in pbar:
-            # perturb wp code
-            wp_merge = torch.cat(wp_split, dim=1)
-            # perturb until 1/3 of iterations
-            t = max(0, float(self.iterations - idx * 3)/(self.iterations))
-            wp_tilde = wp_merge + torch.randn(wp_merge.shape, device=self.device) * t * t
+        wp_split = [wp[:, :9].clone().detach(), wp[:, 9:self.num_layers-1].clone().detach(), wp[:, self.num_layers-1:].clone().detach()]
+        wp_split[0].requires_grad=True
+        wp_split[1].requires_grad=True
+        wp_split[2].requires_grad=True
 
-            # fake_image, _ = self.g_ema(wp_tilde, input_is_wp=True, randomize_noise=False)
-            # fake_image, _ = self.g_ema(wp_merge, input_is_wp=True, randomize_noise=False)
-            fake_image, _ = self.g_ema(wp_tilde, noise=noises, input_is_wp=True, randomize_noise=False)
-            # fake_image, _ = self.g_ema(wp_merge, noise=noises, input_is_wp=True, randomize_noise=False)
+        # include noise optimizer
+        # optimizer = torch.optim.Adam([wp_split[0], wp_split[1], wp_split[2]], lr=self.lr)
+        optimizer = torch.optim.Adam([wp_split[0], wp_split[2]], lr=self.lr)
+        pbar = range(self.iterations)
+        pbar = tqdm(pbar, initial=0, dynamic_ncols=True, smoothing=0.01)
+        for idx in pbar:
+            if self.perturb_wp:
+                wp_input = torch.cat(wp_split, dim=1)
+                # perturb for first 1/3 iterations
+                t = max(0, float(self.iterations - idx * 3)/(self.iterations))
+                wp_input = wp_input + torch.randn(wp_input.shape, device=self.device) * t * t
+            else:
+                wp_input = torch.cat(wp_split, dim=1)
+
+            fake_image, _ = self.g_ema(wp_input, input_is_wp=True, randomize_noise=False)
             pm_loss = self.photometric_loss(image, fake_image, photometric_mask)
             id_loss = self.identity_loss(i0, fake_image)
             lm_loss = self.landmark_loss(landmarks, fake_image)
             pc_loss = self.perceptual_loss(image, fake_image, perceptual_mask)
 
-            # noise loss
-            loss_noise = self.noise_regularize(noises)
-
             loss = pm_loss * self.lambda_photometric +\
                     id_loss * self.lambda_identity +\
                     pc_loss * self.lambda_perceptual +\
-                    lm_loss * self.lambda_landmark +\
-                    loss_noise * self.lambda_noise
-                    
+                    lm_loss * self.lambda_landmark 
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            # noise normalization
-            self.noise_normalize_(noises)
-
             pbar.set_description(
                 # 'optimizing: loss: {:2f}; photometric: {:2f}; identity: {:2f}; perceptual: {:2f}'.format(loss, pm_loss, id_loss, pc_loss)
                 'optimizing: photometric: {:2f}; identity: {:2f}; landmark: {:2f}; perceptual: {:2f}'.format(pm_loss, id_loss, lm_loss, pc_loss)
             )
+        
+        if self.optimize_noise:
+            optimizer = torch.optim.Adam(noises, lr=self.lr)
+            
+            pbar = range(self.iterations)
+            pbar = tqdm(pbar, initial=0, dynamic_ncols=True, smoothing=0.01)
+            for idx in pbar:
+                fake_image, _ = self.g_ema(torch.cat(wp_split, dim=1), noise=noises, input_is_wp=True, randomize_noise=False)
+                pm_loss = self.photometric_loss(image, fake_image, photometric_mask)
+                id_loss = self.identity_loss(i0, fake_image)
+                lm_loss = self.landmark_loss(landmarks, fake_image)
+                pc_loss = self.perceptual_loss(image, fake_image, perceptual_mask)
+
+                # noise loss
+                loss_noise = self.noise_regularize(noises)
+
+                loss = pm_loss * self.lambda_photometric +\
+                        id_loss * self.lambda_identity +\
+                        pc_loss * self.lambda_perceptual +\
+                        lm_loss * self.lambda_landmark +\
+                        loss_noise * self.lambda_noise
+                        
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                # noise normalization
+                self.noise_normalize_(noises)
+
+                pbar.set_description(
+                    # 'optimizing: loss: {:2f}; photometric: {:2f}; identity: {:2f}; perceptual: {:2f}'.format(loss, pm_loss, id_loss, pc_loss)
+                    'optimizing: photometric: {:2f}; identity: {:2f}; landmark: {:2f}; perceptual: {:2f}'.format(pm_loss, id_loss, lm_loss, pc_loss)
+                )
         
         return torch.cat(wp_split, dim=1), noises
 
